@@ -1,0 +1,43 @@
+"""Compatibility re-exports for the canonical rich-content contract."""
+
+from app.utils.rich_content import (
+    RichContentEmptyError,
+    RichContentError,
+    RichContentKind,
+    RichContentPolicy,
+    RichContentReviewRequired,
+    RichContentTooLargeError,
+    classify_rich_content,
+    extract_plain_text_from_html,
+    is_rich_content_empty,
+    is_rich_html,
+    normalize_rich_content_for_write,
+    normalize_rich_content_mapping,
+    rich_content_to_plain_text,
+    rich_content_visible_char_count,
+    rich_content_visible_char_count_for_read,
+    sanitize_rich_content,
+    sanitize_rich_html,
+    to_safe_rich_html,
+)
+
+__all__ = [
+    "RichContentEmptyError",
+    "RichContentError",
+    "RichContentKind",
+    "RichContentPolicy",
+    "RichContentReviewRequired",
+    "RichContentTooLargeError",
+    "classify_rich_content",
+    "extract_plain_text_from_html",
+    "is_rich_content_empty",
+    "is_rich_html",
+    "normalize_rich_content_for_write",
+    "normalize_rich_content_mapping",
+    "rich_content_to_plain_text",
+    "rich_content_visible_char_count",
+    "rich_content_visible_char_count_for_read",
+    "sanitize_rich_content",
+    "sanitize_rich_html",
+    "to_safe_rich_html",
+]

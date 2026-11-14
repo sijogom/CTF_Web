@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# Safe Linux deployment coordinator for CTF_Web.
+# This entrypoint only parses arguments; all safety checks and operations live
+# in lib/ctfctl-common.sh so the command contract remains reviewable.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/ctfctl-common.sh
+source "$SCRIPT_DIR/lib/ctfctl-common.sh"
+
+ctfctl_usage() {
+    cat <<'USAGE'
+Usage:
+  ctfctl [global options] preflight [--release <absolute-release-dir>]
+  ctfctl [global options] install [--release-root <absolute-dir>] --confirm install:<release-root-basename>
+  ctfctl [global options] init-jwt-secrets --confirm init-jwt-secrets
+  ctfctl [global options] backup --output <absolute-new-bundle-dir>
+  ctfctl [global options] restore --bundle <absolute-bundle-dir> --confirm <exact-bundle-id>
+  ctfctl [global options] migrate --release <absolute-release-dir> --backup <absolute-bundle-dir> --confirm migrate:<release-id>:<bundle-id>
+  ctfctl [global options] deploy --release <absolute-release-dir> --backup <absolute-bundle-dir> --confirm deploy:<release-id>:<bundle-id>
+  ctfctl [global options] smoke-test --base-url <https://host[/ctf]>
+  ctfctl [global options] rollback --release <absolute-release-dir> [--restore <absolute-bundle-dir>] --confirm <exact-rollback-confirmation>
+
+Global options (must precede the command):
+  --env-file <absolute-file>        Default: /etc/ctf-web/ctf-web.env
+  --contract-file <absolute-file>   Default: /etc/ctf-web/backup-contract.env
+  --release-root <absolute-dir>     Default: /opt/ctf-web/releases
+  --current-link <absolute-path>    Default: /opt/ctf-web/current
+  --state-dir <absolute-dir>        Default: /var/lib/ctf-web/ctfctl
+
+Safety properties:
+  - The Compose project is permanently fixed to ctf_web.
+  - Secret values are never printed or copied into manifests.
+  - Production-changing commands require an exact --confirm value.
+  - This safety version fails closed if CTFd DB/upload backup evidence, exact
+    CTFd migration evidence, rollback compatibility, release-manifest binding,
+    or immutable image digests are not explicitly declared and verified.
+
+Read infra/scripts/ctfctl-README.md before invoking a state-changing command.
+USAGE
+}
+
+ctfctl_require_option_value() {
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "$value" && "$value" != --* ]] || ctfctl_die "OPTION_VALUE_MISSING" "${option} requires a value"
+}
+
+ctfctl_parse_global_options() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --env-file)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_ENV_FILE="$2"
+                shift 2
+                ;;
+            --contract-file)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_CONTRACT_FILE="$2"
+                shift 2
+                ;;
+            --release-root)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_RELEASE_ROOT="$2"
+                shift 2
+                ;;
+            --current-link)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_CURRENT_LINK="$2"
+                shift 2
+                ;;
+            --state-dir)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_STATE_DIR="$2"
+                shift 2
+                ;;
+            --help|-h)
+                ctfctl_usage
+                exit 0
+                ;;
+            --*)
+                ctfctl_die "UNKNOWN_GLOBAL_OPTION" "unknown global option"
+                ;;
+            *)
+                CTFCTL_COMMAND="$1"
+                shift
+                CTFCTL_COMMAND_ARGS=("$@")
+                return 0
+                ;;
+        esac
+    done
+    ctfctl_die "COMMAND_MISSING" "a ctfctl command is required"
+}
+
+ctfctl_parse_no_extra_args() {
+    (( $# == 0 )) || ctfctl_die "UNEXPECTED_ARGUMENT" "unexpected command argument"
+}
+
+ctfctl_command_preflight() {
+    local release=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --release)
+                ctfctl_require_option_value "$1" "${2:-}"
+                release="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "preflight accepts only --release" ;;
+        esac
+    done
+    [[ -n "$release" ]] || release="$(ctfctl_active_release)"
+    ctfctl_preflight "$release"
+}
+
+ctfctl_command_install() {
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --release-root)
+                ctfctl_require_option_value "$1" "${2:-}"
+                CTFCTL_RELEASE_ROOT="$2"
+                shift 2
+                ;;
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "install accepts only --release-root and --confirm" ;;
+        esac
+    done
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "install requires --confirm install:<release-root-basename>"
+    ctfctl_install "$CTFCTL_RELEASE_ROOT" "$confirmation"
+}
+
+ctfctl_command_init_jwt_secrets() {
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "init-jwt-secrets accepts only --confirm" ;;
+        esac
+    done
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "init-jwt-secrets requires --confirm init-jwt-secrets"
+    ctfctl_init_jwt_secrets "$confirmation"
+}
+
+ctfctl_command_backup() {
+    local output=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --output)
+                ctfctl_require_option_value "$1" "${2:-}"
+                output="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "backup accepts only --output" ;;
+        esac
+    done
+    [[ -n "$output" ]] || ctfctl_die "OUTPUT_REQUIRED" "backup requires --output <absolute-new-bundle-dir>"
+    ctfctl_backup "$output"
+}
+
+ctfctl_command_restore() {
+    local bundle=""
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --bundle)
+                ctfctl_require_option_value "$1" "${2:-}"
+                bundle="$2"
+                shift 2
+                ;;
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "restore accepts only --bundle and --confirm" ;;
+        esac
+    done
+    [[ -n "$bundle" ]] || ctfctl_die "BUNDLE_REQUIRED" "restore requires --bundle"
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "restore requires --confirm <exact-bundle-id>"
+    ctfctl_restore "$bundle" "$confirmation"
+}
+
+ctfctl_command_migrate() {
+    local release=""
+    local bundle=""
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --release)
+                ctfctl_require_option_value "$1" "${2:-}"
+                release="$2"
+                shift 2
+                ;;
+            --backup)
+                ctfctl_require_option_value "$1" "${2:-}"
+                bundle="$2"
+                shift 2
+                ;;
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "migrate accepts only --release, --backup, and --confirm" ;;
+        esac
+    done
+    [[ -n "$release" && -n "$bundle" ]] || ctfctl_die "MIGRATE_ARGUMENTS_REQUIRED" "migrate requires --release and --backup"
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "migrate requires --confirm migrate:<release-id>:<bundle-id>"
+    ctfctl_migrate "$release" "$bundle" "$confirmation"
+}
+
+ctfctl_command_deploy() {
+    local release=""
+    local bundle=""
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --release)
+                ctfctl_require_option_value "$1" "${2:-}"
+                release="$2"
+                shift 2
+                ;;
+            --backup)
+                ctfctl_require_option_value "$1" "${2:-}"
+                bundle="$2"
+                shift 2
+                ;;
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "deploy accepts only --release, --backup, and --confirm" ;;
+        esac
+    done
+    [[ -n "$release" && -n "$bundle" ]] || ctfctl_die "DEPLOY_ARGUMENTS_REQUIRED" "deploy requires --release and --backup"
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "deploy requires --confirm deploy:<release-id>:<bundle-id>"
+    ctfctl_deploy "$release" "$bundle" "$confirmation"
+}
+
+ctfctl_command_smoke_test() {
+    local base_url=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --base-url)
+                ctfctl_require_option_value "$1" "${2:-}"
+                base_url="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "smoke-test accepts only --base-url" ;;
+        esac
+    done
+    [[ -n "$base_url" ]] || ctfctl_die "BASE_URL_REQUIRED" "smoke-test requires --base-url"
+    ctfctl_smoke_test "$base_url"
+}
+
+ctfctl_command_rollback() {
+    local release=""
+    local restore_bundle=""
+    local confirmation=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --release)
+                ctfctl_require_option_value "$1" "${2:-}"
+                release="$2"
+                shift 2
+                ;;
+            --restore)
+                ctfctl_require_option_value "$1" "${2:-}"
+                restore_bundle="$2"
+                shift 2
+                ;;
+            --confirm)
+                ctfctl_require_option_value "$1" "${2:-}"
+                confirmation="$2"
+                shift 2
+                ;;
+            *) ctfctl_die "UNKNOWN_OPTION" "rollback accepts only --release, --restore, and --confirm" ;;
+        esac
+    done
+    [[ -n "$release" ]] || ctfctl_die "RELEASE_REQUIRED" "rollback requires --release"
+    [[ -n "$confirmation" ]] || ctfctl_die "CONFIRMATION_REQUIRED" "rollback requires --confirm"
+    ctfctl_rollback "$release" "$restore_bundle" "$confirmation"
+}
+
+CTFCTL_COMMAND=""
+CTFCTL_COMMAND_ARGS=()
+ctfctl_parse_global_options "$@"
+
+case "$CTFCTL_COMMAND" in
+    preflight) ctfctl_command_preflight "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    install) ctfctl_command_install "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    init-jwt-secrets) ctfctl_command_init_jwt_secrets "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    backup) ctfctl_command_backup "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    restore) ctfctl_command_restore "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    migrate) ctfctl_command_migrate "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    deploy) ctfctl_command_deploy "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    smoke-test) ctfctl_command_smoke_test "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    rollback) ctfctl_command_rollback "${CTFCTL_COMMAND_ARGS[@]}" ;;
+    help) ctfctl_usage ;;
+    *)
+        ctfctl_usage >&2
+        ctfctl_die "UNKNOWN_COMMAND" "unsupported ctfctl command"
+        ;;
+esac

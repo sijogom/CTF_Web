@@ -1,0 +1,70 @@
+# 환경 변수
+.env
+.env.local
+.env.production
+
+# JWT PEM 키 (절대 커밋 금지)
+*.pem
+
+# 의존성
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+vendor/
+
+# 빌드
+.next/
+out/
+dist/
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# Docker 볼륨 데이터
+/data/
+/infra/data/
+/ctfd/data/
+/services/*/data/
+/volumes/
+/infra/volumes/
+
+# Verification state and browser sessions are not deployment source.
+.verification/
+.playwright-mcp/
+.playwright-cli/
+*cookies.txt
+tsconfig.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 로그
+*.log
+logs/
+
+# 공개 소스에서 제외하는 내부 자료와 로컬 비밀
+/docs/
+/mockups/
+/MEMORY.md
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+/services/learn/seed_challenges.py
+
+# 로컬 개발 도구 설정과 작업 기록
+AGENTS.md
+CLAUDE.md
+MEMORY.md
+.codex/
+.claude/
+.cursor/

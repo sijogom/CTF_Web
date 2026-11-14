@@ -1,0 +1,500 @@
+# 프로덕션 오버라이드
+# 사용법: docker compose -p ctf_web -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# 핵심 아키텍처 결정 (Windows+WSL2 서버):
+# - Caddy + env-orchestrator: network_mode: host → Caddyfile의 localhost:PORT가 그대로 동작
+# - Frontend: Docker bridge → Caddy에서 localhost:3100 접근 (host 모드이므로 가능)
+# - 나머지: Docker bridge + 127.0.0.1:PORT 포트 매핑
+
+services:
+  postgres:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  redis:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  minio:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  ctfd:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  auth-service:
+    restart: always
+    # env-orchestrator가 host 모드이므로 bridge에서 접근하려면 host-gateway 필요
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ENVIRONMENT: production
+      # learn-service: 같은 bridge → Docker DNS
+      LEARN_SERVICE_URL: http://learn-service:8100
+      COMMUNITY_SERVICE_URL: http://community-service:8300
+      # env-orchestrator: host 모드 → Docker 호스트 경유
+      ENV_ORCHESTRATOR_URL: http://host.docker.internal:8200
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      FRONTEND_URL: https://${SITE_DOMAIN:-localhost}/ctf
+      COOKIE_BASE_PATH: /ctf
+      COOKIE_SECURE: "true"
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TLS: ${SMTP_TLS:-true}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # File-backed Compose secrets keep their host owner/mode. The root
+    # entrypoint needs CHOWN only while it copies the private key into tmpfs,
+    # then execs the application as UID 1001.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp
+      # The root entrypoint must be able to create the appuser-owned runtime
+      # copy before dropping privileges with gosu. It changes this directory
+      # to appuser:appuser 0700 before exec, so the secret remains private.
+      - /run/ctf-runtime-secrets:uid=0,gid=0,mode=0700
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+  personal-notification-runner:
+    restart: always
+    environment:
+      ENVIRONMENT: production
+      FRONTEND_URL: https://${SITE_DOMAIN:-localhost}/ctf
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TLS: ${SMTP_TLS:-true}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/ctf-runtime-secrets:uid=0,gid=0,mode=0700
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+  clamav:
+    restart: always
+    # ClamAV recommends 4 GiB for the daemon and signature database. The scan
+    # budget and base pids/tmpfs limits still bound hostile archive handling;
+    # a scanner error is denied by the Learn API.
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+          cpus: "1.0"
+
+  learn-service:
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+      clamav:
+        # A new signature database can take minutes to download. Keep non-upload
+        # Learn API routes available, while the upload adapter itself waits for
+        # an actual clamd verdict and otherwise denies storage with 503.
+        condition: service_started
+    environment:
+      ENVIRONMENT: production
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      ENV_ORCHESTRATOR_URL: http://host.docker.internal:8200
+      BASE_PATH: /ctf
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # python-multipart may spool a valid education attachment before the
+      # endpoint can enforce its file limit.  This bounded tmpfs fails closed
+      # instead of consuming host storage; Caddy scopes the 256 MiB body cap to
+      # the education upload routes, so existing lesson/challenge routes retain
+      # their own API limits.
+      - /tmp:rw,nosuid,nodev,noexec,size=640m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "0.5"
+
+  knowledge-candidate-runner:
+    restart: always
+    environment:
+      ENVIRONMENT: production
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      # 운영에서는 공개 콘텐츠 변경을 자동으로 후보화한다. 생성 결과는
+      # pending_review 원장에만 기록되며 자동 승인·자동 공개는 하지 않는다.
+      # 명시적으로 false를 넣으면 운영에서도 중지할 수 있다.
+      KNOWLEDGE_CANDIDATE_RUNNER_ENABLED: ${KNOWLEDGE_CANDIDATE_RUNNER_ENABLED:-true}
+      KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS: ${KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS:-900}
+      KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES: ${KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES:-100}
+      KNOWLEDGE_CANDIDATE_RUNNER_ID: ${KNOWLEDGE_CANDIDATE_RUNNER_ID:-knowledge-candidate-runner}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  education-asset-cleanup-runner:
+    restart: always
+    environment:
+      ENVIRONMENT: production
+      EDUCATION_ASSET_CLEANUP_ENABLED: ${EDUCATION_ASSET_CLEANUP_ENABLED:-true}
+      EDUCATION_ASSET_CLEANUP_POLL_SECONDS: ${EDUCATION_ASSET_CLEANUP_POLL_SECONDS:-5}
+      EDUCATION_ASSET_CLEANUP_LEASE_SECONDS: ${EDUCATION_ASSET_CLEANUP_LEASE_SECONDS:-60}
+      EDUCATION_ASSET_CLEANUP_MAX_ATTEMPTS: ${EDUCATION_ASSET_CLEANUP_MAX_ATTEMPTS:-10}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  challenge-image-cleanup-runner:
+    restart: always
+    # Env-orchestrator는 host 네트워크에서 127.0.0.1:8200만 수신한다.
+    # bridge 컨테이너의 host.docker.internal은 loopback 서비스에 도달하지
+    # 못하므로, 정리 outbox 워커도 같은 host 네트워크에서 실행한다.
+    network_mode: host
+    networks: !reset []
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@127.0.0.1:5432/learn_db
+      ENV_ORCHESTRATOR_URL: http://127.0.0.1:8200
+      CHALLENGE_IMAGE_CLEANUP_ENABLED: ${CHALLENGE_IMAGE_CLEANUP_ENABLED:-true}
+      CHALLENGE_IMAGE_CLEANUP_POLL_SECONDS: ${CHALLENGE_IMAGE_CLEANUP_POLL_SECONDS:-5}
+      CHALLENGE_IMAGE_CLEANUP_LEASE_SECONDS: ${CHALLENGE_IMAGE_CLEANUP_LEASE_SECONDS:-60}
+      CHALLENGE_IMAGE_CLEANUP_MAX_ATTEMPTS: ${CHALLENGE_IMAGE_CLEANUP_MAX_ATTEMPTS:-20}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  lesson-image-reconcile-runner:
+    restart: always
+    environment:
+      ENVIRONMENT: production
+      LESSON_IMAGE_RECONCILE_ENABLED: ${LESSON_IMAGE_RECONCILE_ENABLED:-true}
+      LESSON_IMAGE_RECONCILE_POLL_SECONDS: ${LESSON_IMAGE_RECONCILE_POLL_SECONDS:-60}
+      LESSON_IMAGE_STAGED_GRACE_SECONDS: ${LESSON_IMAGE_STAGED_GRACE_SECONDS:-86400}
+      LESSON_IMAGE_ORPHAN_GRACE_SECONDS: ${LESSON_IMAGE_ORPHAN_GRACE_SECONDS:-86400}
+      LESSON_IMAGE_RECONCILE_LEASE_SECONDS: ${LESSON_IMAGE_RECONCILE_LEASE_SECONDS:-120}
+      LESSON_IMAGE_RECONCILE_BATCH_SIZE: ${LESSON_IMAGE_RECONCILE_BATCH_SIZE:-100}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  community-service:
+    restart: always
+    environment:
+      ENVIRONMENT: production
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+  community-inquiry-runner: &community-runner-production
+    restart: always
+    environment:
+      ENVIRONMENT: production
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  marketplace-settlement-runner:
+    <<: *community-runner-production
+
+  comment-notification-runner:
+    <<: *community-runner-production
+
+  community-migrate:
+    environment:
+      ENVIRONMENT: production
+
+  auth-migrate:
+    environment:
+      ENVIRONMENT: production
+
+  learn-migrate:
+    environment:
+      ENVIRONMENT: production
+
+  env-orchestrator:
+    restart: always
+    # host 모드: Caddy(host)에서 localhost:8200 접근 + Docker 소켓 필요
+    network_mode: host
+    # Learn이 발급한 MinIO presigned URL의 호스트명을 유지한다. host 모드에서는
+    # Compose service DNS를 사용할 수 없으므로 loopback publish로 해석한다.
+    extra_hosts:
+      - "minio=127.0.0.1"
+    networks: !reset []
+    ports: !reset []
+    volumes:
+      # host-network 운영 경로도 Docker 데몬이 접근하는 동일한 runtime
+      # 디렉터리를 사용한다. 파일이 없는 호스트에서는 Compose가 생성하지 않는다.
+      - type: bind
+        source: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        target: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        read_only: false
+        bind:
+          create_host_path: false
+    depends_on: !reset []
+    environment:
+      GIN_MODE: release
+      # host-network 운영 경로에서 Env API를 외부 인터페이스에 직접 bind하지 않는다.
+      LISTEN_ADDR: 127.0.0.1:8200
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@localhost:6379/2
+      LEARN_SERVICE_URL: http://localhost:${LEARN_PORT:-8100}
+      AUTH_SERVICE_URL: http://localhost:${AUTH_PORT:-8020}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      CHALLENGE_NETWORK: ctf-challenges
+      CONTAINER_READINESS_TIMEOUT_SECONDS: ${CONTAINER_READINESS_TIMEOUT_SECONDS:-45}
+      CONTAINER_MAX_GLOBAL: ${CONTAINER_MAX_GLOBAL:-50}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3100}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      BASE_PATH: /ctf
+      # base Compose의 shared host bind source와 반드시 동일해야 한다.
+      DYNAMIC_FLAG_RUNTIME_DIR: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  frontend:
+    restart: always
+    build:
+      target: production
+      args:
+        NEXT_PUBLIC_SITE_URL: https://${SITE_DOMAIN:-localhost}/ctf
+        NEXT_PUBLIC_BASE_PATH: /ctf
+        NEXT_PUBLIC_ENV_PROXY_BASE: ""
+        # 챌린지 HostPort는 loopback 전용이다. 외부 참가자는 인증·소유권·대회 기간을
+        # 매 요청마다 검증하는 Caddy/Env 프록시만 사용한다.
+        NEXT_PUBLIC_ENV_ACCESS_MODE: proxy
+    volumes: !reset []
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  caddy:
+    restart: always
+    # 호스트 Nginx가 TLS 80/443을 소유하고 /ctf/*를 localhost:8080으로
+    # 전달한다. Caddy는 그 내부 upstream 포트만 소유한다.
+    network_mode: host
+    networks: !reset []
+    ports: !reset []
+    environment:
+      SITE_DOMAIN: "${SITE_DOMAIN:?SITE_DOMAIN must be configured for production TLS}"
+      CADDY_SITE_ADDRESS: ":8080"
+      FRONTEND_HOST: localhost
+      AUTH_HOST: localhost
+      LEARN_HOST: localhost
+      COMMUNITY_HOST: localhost
+      ENV_ORCH_HOST: localhost
+      # MinIO는 host network에서 IPv4 loopback으로 publish된다. localhost가
+      # IPv6(::1)로 해석되면 Caddy의 storage proxy가 500을 반환한다.
+      MINIO_HOST: 127.0.0.1
+      AUTH_PORT: ${AUTH_PORT:-8020}
+      LEARN_PORT: ${LEARN_PORT:-8100}
+      COMMUNITY_PORT: ${COMMUNITY_PORT:-8300}
+      ENV_ORCH_PORT: ${ENV_ORCH_PORT:-8200}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3100}
+    depends_on: !reset []
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+# env-orchestrator가 host 모드로 전환되면서 ctf-challenges 네트워크 참조가 제거됨.
+# 챌린지 컨테이너가 이 네트워크에 attach되므로 명시적으로 유지 필요.
+# external: true → deploy.sh에서 사전 생성, compose가 삭제하지 않음.
+networks:
+  ctf-challenges:
+    external: true
+    name: ctf-challenges

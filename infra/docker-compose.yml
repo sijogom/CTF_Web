@@ -1,0 +1,821 @@
+# 프로덕션 기본 구성 — 전체 스택 컨테이너 실행
+# 사용법: docker compose -p ctf_web -f docker-compose.yml up -d
+# 오버라이드: docker compose -p ctf_web -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  # === 인프라 ===
+  postgres:
+    image: postgres:16-alpine
+    container_name: ctf-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ctfplatform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-changeme_auth}
+      LEARN_DB_PASSWORD: ${LEARN_DB_PASSWORD:-changeme_learn}
+      COMMUNITY_DB_PASSWORD: ${COMMUNITY_DB_PASSWORD:-changeme_community}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ctf-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ctfplatform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ctf-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ctf-internal
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: ctf-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - ctf-internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # === CTFd API 서버 ===
+  # Named upload storage is initialized before CTFd starts. CTFd 3.7.3 runs as
+  # UID 1001, so a fresh Docker volume must not remain root-owned.
+  ctfd-upload-init:
+    build:
+      context: ../ctfd
+      dockerfile: Dockerfile
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 1001:1001 /var/uploads && chmod 0750 /var/uploads"]
+    restart: "no"
+    volumes:
+      - ctfd_uploads:/var/uploads
+    networks:
+      - ctf-internal
+
+  ctfd:
+    build:
+      context: ../ctfd
+      dockerfile: Dockerfile
+    container_name: ctf-ctfd
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ctfplatform}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/ctfd_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/1
+      SECRET_KEY: ${CTFD_SECRET_KEY:-ctfd-dev-secret-change-me}
+      REVERSE_PROXY: "true"
+      UPLOAD_FOLDER: /var/uploads
+    command: ["gunicorn", "CTFd:create_app()", "--bind", "0.0.0.0:8000", "--workers", "1", "--worker-class", "gevent"]
+    ports:
+      - "127.0.0.1:8010:8000"
+    volumes:
+      - ctfd_uploads:/var/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ctfd-upload-init:
+        condition: service_completed_successfully
+    networks:
+      - ctf-internal
+    healthcheck:
+      # CTFd image does not ship curl; use the Python runtime already present.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8000/healthcheck', timeout=3); raise SystemExit(0 if response.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # === 인증 서비스 ===
+  # Auth의 독립 원장 migration은 application worker보다 먼저 한 번만 실행한다.
+  # 기존 core schema bootstrap을 재작성하지 않으며, 실패 시 auth-service는 시작하지 않는다.
+  auth-migrate:
+    build:
+      context: ../services/auth
+      dockerfile: Dockerfile
+    restart: "no"
+    # 빈 Auth DB 또는 완전한 legacy Auth core만 전용 wrapper가 처리한다.
+    # 부분/미확인 schema는 DDL·stamp 전에 fail-closed 하고, versioned DB는
+    # create_all 없이 Alembic upgrade 경로만 사용한다.
+    command: ["python", "-m", "app.scripts.auth_migrate"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://auth_svc:${AUTH_DB_PASSWORD:-changeme_auth}@postgres:5432/platform_db
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      JWT_SECRET_KEY_FILE: /run/ctf-runtime-secrets/jwt_private.pem
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - auth_jwt_private_key
+      - platform_jwt_public_key
+
+  auth-service:
+    build:
+      context: ../services/auth
+      dockerfile: Dockerfile
+    container_name: ctf-auth
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://auth_svc:${AUTH_DB_PASSWORD:-changeme_auth}@postgres:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      CTFD_URL: http://ctfd:8000
+      CTFD_ADMIN_TOKEN: ${CTFD_ADMIN_TOKEN:-}
+      JWT_SECRET_KEY_FILE: /run/ctf-runtime-secrets/jwt_private.pem
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-noreply@ctf.example.ac.kr}
+      SMTP_TLS: ${SMTP_TLS:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      LEARN_SERVICE_URL: http://learn-service:8100
+      COMMUNITY_SERVICE_URL: http://community-service:8300
+      ENV_ORCHESTRATOR_URL: http://env-orchestrator:8200
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      DISCORD_MEMBER_ROLE_ID: ${DISCORD_MEMBER_ROLE_ID:-}
+    ports:
+      - "127.0.0.1:${AUTH_PORT:-8020}:8020"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth-migrate:
+        condition: service_completed_successfully
+    networks:
+      - ctf-internal
+    secrets:
+      - auth_jwt_private_key
+      - platform_jwt_public_key
+    healthcheck:
+      # python:3.12-slim 이미지에는 curl이 기본 포함되지 않는다.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8020/health', timeout=3); raise SystemExit(0 if response.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  personal-notification-runner:
+    build:
+      context: ../services/auth
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.personal_notification_runner"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://auth_svc:${AUTH_DB_PASSWORD:-changeme_auth}@postgres:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      JWT_SECRET_KEY_FILE: /run/ctf-runtime-secrets/jwt_private.pem
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      LEARN_SERVICE_URL: http://learn-service:8100
+      COMMUNITY_SERVICE_URL: http://community-service:8300
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-noreply@ctf.example.ac.kr}
+      SMTP_TLS: ${SMTP_TLS:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      PERSONAL_NOTIFICATION_POLL_SECONDS: ${PERSONAL_NOTIFICATION_POLL_SECONDS:-10}
+      PERSONAL_NOTIFICATION_HEALTH_PORT: "8040"
+    depends_on:
+      auth-migrate:
+        condition: service_completed_successfully
+      auth-service:
+        condition: service_healthy
+      learn-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - auth_jwt_private_key
+      - platform_jwt_public_key
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8040/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # === 학습 서비스 ===
+  # 스키마 변경은 앱 워커보다 먼저 단일 migration job에서 적용한다. 실패 시
+  # learn-service를 시작하지 않아 반쯤 적용된 코드/DB 조합을 노출하지 않는다.
+  # The education attachment scanner is intentionally reachable only from
+  # learn-service over ctf-scanner. Do not add a host `ports` mapping: clamd
+  # does not provide transport authentication or encryption.
+  clamav:
+    image: clamav/clamav:1.5
+    container_name: ctf-clamav
+    restart: unless-stopped
+    environment:
+      CLAMAV_NO_MILTERD: "true"
+      FRESHCLAM_CHECKS: "12"
+      # Match the API's 250 MiB ingress limit. AlertExceedsMax makes archive or
+      # engine limits a rejection verdict instead of a possibly partial clean scan.
+      CLAMD_CONF_StreamMaxLength: "250M"
+      CLAMD_CONF_MaxFileSize: "250M"
+      CLAMD_CONF_MaxScanSize: "300M"
+      CLAMD_CONF_MaxScanTime: "120000"
+      CLAMD_CONF_MaxRecursion: "16"
+      CLAMD_CONF_MaxFiles: "10000"
+      CLAMD_CONF_MaxThreads: "2"
+      CLAMD_CONF_MaxQueue: "4"
+      CLAMD_CONF_ReadTimeout: "150"
+      CLAMD_CONF_CommandReadTimeout: "10"
+      CLAMD_CONF_AlertExceedsMax: "yes"
+      CLAMD_CONF_EnableShutdownCommand: "no"
+    volumes:
+      - clamav_data:/var/lib/clamav
+    networks:
+      - ctf-scanner
+    # The official entrypoint performs only database ownership/bootstrap work as
+    # root, then clamd and freshclam run as the image's `clamav` user. Keep the
+    # bootstrap capability set explicit rather than granting all capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    deploy:
+      resources:
+        limits:
+          pids: 128
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 6m
+
+  learn-migrate:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    restart: "no"
+    # 완전히 빈 Learn DB만 명시 bootstrap(create_all→contract verify→stamp)한다.
+    # version marker가 있는 기존 DB는 Alembic upgrade, partial/unversioned DB는
+    # DDL 이전 fail-closed로 중단한다.
+    command: ["python", "-m", "app.scripts.learn_migrate"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      # 1 is supplied only by an approved legacy-adoption run. The default is
+      # fail-closed for unversioned databases.
+      LEARN_SCHEMA_ADOPT_LEGACY: ${LEARN_SCHEMA_ADOPT_LEGACY:-0}
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  learn-service:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    container_name: ctf-learn
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      AUTH_SERVICE_URL: http://auth-service:8020
+      ENV_ORCHESTRATOR_URL: http://env-orchestrator:8200
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      # 기능을 켠 경우 keyring이 없으면 Learn이 발급·공개를 fail-closed 한다.
+      DYNAMIC_INSTANCE_FLAGS_ENABLED: ${DYNAMIC_INSTANCE_FLAGS_ENABLED:-false}
+      DYNAMIC_FLAG_HMAC_KEYRING: ${DYNAMIC_FLAG_HMAC_KEYRING:-}
+      # scheduled 후보 생성은 기본 비활성이다. API 상태 조회와 runner가 같은 값을 읽는다.
+      KNOWLEDGE_CANDIDATE_RUNNER_ENABLED: ${KNOWLEDGE_CANDIDATE_RUNNER_ENABLED:-false}
+      KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS: ${KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS:-900}
+      KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES: ${KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES:-100}
+      KNOWLEDGE_CANDIDATE_RUNNER_ID: ${KNOWLEDGE_CANDIDATE_RUNNER_ID:-knowledge-candidate-runner}
+      EDUCATION_ASSET_SCANNER_HOST: clamav
+      EDUCATION_ASSET_SCANNER_PORT: "3310"
+      EDUCATION_ASSET_SCANNER_CONNECT_TIMEOUT_SECONDS: "3"
+      EDUCATION_ASSET_SCANNER_IO_TIMEOUT_SECONDS: "150"
+    ports:
+      - "127.0.0.1:${LEARN_PORT:-8100}:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+      # Do not wait for the long initial signature download here: the upload
+      # endpoint performs its own INSTREAM verdict and returns 503 until clamd
+      # is actually ready, while non-upload education features remain usable.
+      clamav:
+        condition: service_started
+    networks:
+      - ctf-internal
+      - ctf-scanner
+    secrets:
+      - platform_jwt_public_key
+    healthcheck:
+      # python:3.12-slim 이미지에는 curl이 기본 포함되지 않는다.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8100/health', timeout=3); raise SystemExit(0 if response.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Learn API와 분리된 내부 전용 규칙 후보 runner.
+  # 기본값은 비활성이며, enabled여도 pending_review proposal만 만든다.
+  # PostgreSQL advisory lock으로 여러 컨테이너가 있어도 한 번에 하나만 실행한다.
+  knowledge-candidate-runner:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.knowledge_candidate_runner"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      KNOWLEDGE_CANDIDATE_RUNNER_ENABLED: ${KNOWLEDGE_CANDIDATE_RUNNER_ENABLED:-false}
+      KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS: ${KNOWLEDGE_CANDIDATE_RUNNER_INTERVAL_SECONDS:-900}
+      KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES: ${KNOWLEDGE_CANDIDATE_RUNNER_MAX_CANDIDATES:-100}
+      KNOWLEDGE_CANDIDATE_RUNNER_ID: ${KNOWLEDGE_CANDIDATE_RUNNER_ID:-knowledge-candidate-runner}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  # === 커뮤니티 서비스 ===
+  # Community schema migration은 application worker보다 먼저 1회 실행한다.
+  # 기존 DB의 예상 밖/부분 schema는 자동 복구하지 않고 migration을 실패시킨다.
+  # Education asset soft-delete outbox worker. It has no external port and only
+  # removes private MinIO objects after the metadata transaction is committed.
+  education-asset-cleanup-runner:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.education_asset_cleanup_runner"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      EDUCATION_ASSET_CLEANUP_ENABLED: ${EDUCATION_ASSET_CLEANUP_ENABLED:-true}
+      EDUCATION_ASSET_CLEANUP_POLL_SECONDS: ${EDUCATION_ASSET_CLEANUP_POLL_SECONDS:-5}
+      EDUCATION_ASSET_CLEANUP_LEASE_SECONDS: ${EDUCATION_ASSET_CLEANUP_LEASE_SECONDS:-60}
+      EDUCATION_ASSET_CLEANUP_MAX_ATTEMPTS: ${EDUCATION_ASSET_CLEANUP_MAX_ATTEMPTS:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+      learn-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  # 문제 삭제 transaction이 커밋한 Docker image cleanup outbox를 Env에
+  # 전달한다. 외부 포트는 열지 않으며, 컨테이너가 남아 있으면 재시도한다.
+  challenge-image-cleanup-runner:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.challenge_image_cleanup_runner"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ENV_ORCHESTRATOR_URL: http://env-orchestrator:8200
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      CHALLENGE_IMAGE_CLEANUP_ENABLED: ${CHALLENGE_IMAGE_CLEANUP_ENABLED:-true}
+      CHALLENGE_IMAGE_CLEANUP_POLL_SECONDS: ${CHALLENGE_IMAGE_CLEANUP_POLL_SECONDS:-5}
+      CHALLENGE_IMAGE_CLEANUP_LEASE_SECONDS: ${CHALLENGE_IMAGE_CLEANUP_LEASE_SECONDS:-60}
+      CHALLENGE_IMAGE_CLEANUP_MAX_ATTEMPTS: ${CHALLENGE_IMAGE_CLEANUP_MAX_ATTEMPTS:-20}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+      learn-service:
+        condition: service_healthy
+      env-orchestrator:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  # 레슨 본문 이미지의 staged/attached/orphan 상태를 재조정하고,
+  # grace period가 지난 객체만 MinIO에서 정리한다. 외부 포트는 열지 않는다.
+  lesson-image-reconcile-runner:
+    build:
+      context: ../services/learn
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.lesson_image_reconcile_runner"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://learn_svc:${LEARN_DB_PASSWORD:-changeme_learn}@postgres:5432/learn_db
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      LESSON_IMAGE_RECONCILE_ENABLED: ${LESSON_IMAGE_RECONCILE_ENABLED:-true}
+      LESSON_IMAGE_RECONCILE_POLL_SECONDS: ${LESSON_IMAGE_RECONCILE_POLL_SECONDS:-60}
+      LESSON_IMAGE_STAGED_GRACE_SECONDS: ${LESSON_IMAGE_STAGED_GRACE_SECONDS:-86400}
+      LESSON_IMAGE_ORPHAN_GRACE_SECONDS: ${LESSON_IMAGE_ORPHAN_GRACE_SECONDS:-86400}
+      LESSON_IMAGE_RECONCILE_LEASE_SECONDS: ${LESSON_IMAGE_RECONCILE_LEASE_SECONDS:-120}
+      LESSON_IMAGE_RECONCILE_BATCH_SIZE: ${LESSON_IMAGE_RECONCILE_BATCH_SIZE:-100}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      learn-migrate:
+        condition: service_completed_successfully
+      learn-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  community-migrate:
+    build:
+      context: ../services/community
+      dockerfile: Dockerfile
+    restart: "no"
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://community_svc:${COMMUNITY_DB_PASSWORD:-changeme_community}@postgres:5432/community_db
+      # 1 is supplied only by an approved exact legacy-adoption run.
+      COMMUNITY_LEGACY_ADOPT: ${COMMUNITY_LEGACY_ADOPT:-0}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+
+  community-service:
+    build:
+      context: ../services/community
+      dockerfile: Dockerfile
+    container_name: ctf-community
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://community_svc:${COMMUNITY_DB_PASSWORD:-changeme_community}@postgres:5432/community_db
+      AUTH_SERVICE_URL: http://auth-service:8020
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "127.0.0.1:${COMMUNITY_PORT:-8300}:8300"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      community-migrate:
+        condition: service_completed_successfully
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+    healthcheck:
+      # python:3.12-slim 이미지에는 curl이 기본 포함되지 않는다.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8300/health', timeout=3); raise SystemExit(0 if response.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Community API와 분리된 내부 전용 문의 알림 전달 워커.
+  # 외부 포트를 열지 않으며, Community outbox를 lease한 뒤 Auth 내부 API에만 전달한다.
+  # 두 서비스의 migration 및 health gate가 통과하기 전에는 시작하지 않는다.
+  community-inquiry-runner:
+    build:
+      context: ../services/community
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.inquiry_delivery_runner"]
+    environment:
+      COMMUNITY_SERVICE_URL: http://community-service:8300
+      AUTH_SERVICE_URL: http://auth-service:8020
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      INQUIRY_RUNNER_POLL_SECONDS: ${INQUIRY_RUNNER_POLL_SECONDS:-2}
+      INQUIRY_RUNNER_BATCH_SIZE: ${INQUIRY_RUNNER_BATCH_SIZE:-5}
+      INQUIRY_RUNNER_HTTP_TIMEOUT_SECONDS: ${INQUIRY_RUNNER_HTTP_TIMEOUT_SECONDS:-8}
+      INQUIRY_RUNNER_HEALTH_PORT: "8310"
+    depends_on:
+      community-migrate:
+        condition: service_completed_successfully
+      auth-migrate:
+        condition: service_completed_successfully
+      community-service:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    stop_grace_period: 30s
+    healthcheck:
+      # python:3.12-slim 이미지에는 curl이 기본 포함되지 않는다.
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8310/health', timeout=3); raise SystemExit(0 if response.status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  marketplace-settlement-runner:
+    build:
+      context: ../services/community
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.marketplace_settlement_runner"]
+    environment: &renewal-community-worker-environment
+      DATABASE_URL: postgresql+asyncpg://community_svc:${COMMUNITY_DB_PASSWORD:-changeme_community}@postgres:5432/community_db
+      AUTH_SERVICE_URL: http://auth-service:8020
+      JWT_PUBLIC_KEY_FILE: /run/secrets/platform_jwt_public_key
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      MARKETPLACE_SETTLEMENT_POLL_SECONDS: ${MARKETPLACE_SETTLEMENT_POLL_SECONDS:-5}
+      MARKETPLACE_SETTLEMENT_BATCH_SIZE: ${MARKETPLACE_SETTLEMENT_BATCH_SIZE:-10}
+      MARKETPLACE_SETTLEMENT_LEASE_SECONDS: ${MARKETPLACE_SETTLEMENT_LEASE_SECONDS:-60}
+      MARKETPLACE_SETTLEMENT_HEALTH_PORT: "8320"
+    depends_on: &renewal-community-worker-dependencies
+      community-migrate:
+        condition: service_completed_successfully
+      community-service:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8320/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  comment-notification-runner:
+    build:
+      context: ../services/community
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.notification_event_runner"]
+    environment:
+      <<: *renewal-community-worker-environment
+      COMMENT_NOTIFICATION_POLL_SECONDS: ${COMMENT_NOTIFICATION_POLL_SECONDS:-5}
+      COMMENT_NOTIFICATION_HEALTH_PORT: "8330"
+    depends_on: *renewal-community-worker-dependencies
+    networks:
+      - ctf-internal
+    secrets:
+      - platform_jwt_public_key
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8330/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # === 라이브 환경 오케스트레이터 ===
+  env-orchestrator:
+    build:
+      context: ../services/env-orchestrator
+      dockerfile: Dockerfile
+    container_name: ctf-env-orchestrator
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/2
+      DOCKER_HOST: unix:///var/run/docker.sock
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      LEARN_SERVICE_URL: http://learn-service:8100
+      AUTH_SERVICE_URL: http://auth-service:8020
+      CHALLENGE_NETWORK: ctf-challenges
+      BASE_PATH: /ctf
+      # Docker daemon이 challenge 컨테이너에 bind mount할 실제 호스트 경로다.
+      # dynamic_instance에만 개별 flag 파일이 생성된다.
+      DYNAMIC_FLAG_RUNTIME_DIR: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+      CONTAINER_READINESS_TIMEOUT_SECONDS: ${CONTAINER_READINESS_TIMEOUT_SECONDS:-45}
+      CONTAINER_MAX_GLOBAL: ${CONTAINER_MAX_GLOBAL:-50}
+      CHALLENGE_PORT_MIN: "10000"
+      CHALLENGE_PORT_MAX: "60000"
+    ports:
+      - "127.0.0.1:8200:8200"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Env-orchestrator가 Docker 데몬에 전달하는 runtime flag/호환성 파일의
+      # 실제 호스트 경로를 공유한다. static/regex는 파일을 만들지 않으며,
+      # dynamic_instance와 flag.txt 호환 HEALTHCHECK에서만 일시적으로 사용한다.
+      - type: bind
+        source: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        target: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        read_only: false
+        bind:
+          create_host_path: false
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      learn-service:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+      - ctf-challenges
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # === 프론트엔드 ===
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: dev
+    container_name: ctf-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3100}:3100"
+    volumes:
+      - ../frontend/src:/app/src
+      - ../frontend/public:/app/public
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost
+    networks:
+      - ctf-internal
+    healthcheck:
+      # node:20-alpine 이미지에는 curl이 기본 포함되지 않는다.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/ctf/ko').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # === Caddy 리버스 프록시 ===
+  caddy:
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: ctf-web-caddy:local
+    container_name: ctf-caddy
+    restart: unless-stopped
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      CADDY_SITE_ADDRESS: "${CADDY_SITE_ADDRESS:-:8080}"
+      FRONTEND_HOST: ${FRONTEND_HOST:-frontend}
+      AUTH_HOST: ${AUTH_HOST:-auth-service}
+      LEARN_HOST: ${LEARN_HOST:-learn-service}
+      COMMUNITY_HOST: ${COMMUNITY_HOST:-community-service}
+      ENV_ORCH_HOST: ${ENV_ORCH_HOST:-env-orchestrator}
+      MINIO_HOST: ${MINIO_HOST:-minio}
+      AUTH_PORT: ${AUTH_PORT:-8020}
+      LEARN_PORT: ${LEARN_PORT:-8100}
+      COMMUNITY_PORT: ${COMMUNITY_PORT:-8300}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3100}
+      ENV_ORCH_PORT: ${ENV_ORCH_PORT:-8200}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - ctf-internal
+    depends_on:
+      - ctfd
+      - auth-service
+      - frontend
+      - learn-service
+      - community-service
+      - env-orchestrator
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:2010/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  clamav_data:
+  ctfd_uploads:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  # PEM source files live outside the release tree and are mounted read-only.
+  # Compose evaluates only their paths; PEM contents are never environment values.
+  auth_jwt_private_key:
+    file: ${JWT_SECRET_KEY_SOURCE:?JWT_SECRET_KEY_SOURCE must point to the private PEM file}
+  platform_jwt_public_key:
+    file: ${JWT_PUBLIC_KEY_SOURCE:?JWT_PUBLIC_KEY_SOURCE must point to the public PEM file}
+
+networks:
+  ctf-internal:
+    driver: bridge
+  ctf-scanner:
+    driver: bridge
+  ctf-challenges:
+    # env-orchestrator가 Docker API로 이 고정 이름을 사용한다.
+    # project-scoped 기본 이름을 쓰면 챌린지 컨테이너 생성 시 네트워크를 찾지 못한다.
+    name: ctf-challenges
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

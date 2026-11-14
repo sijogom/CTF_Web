@@ -1,0 +1,402 @@
+@import "tailwindcss";
+
+@theme {
+  /* === 디자인 토큰 (다크 모드 기본값) === */
+  --color-bg-primary: #0A0E17;
+  --color-bg-surface: #111827;
+  --color-bg-elevated: #1A2332;
+
+  --color-border: #1E293B;
+  --color-border-light: #2D3B4E;
+
+  --color-text-primary: #E2E8F0;
+  --color-text-secondary: #94A3B8;
+  --color-text-muted: #64748B;
+
+  --color-accent-primary: #6366F1;
+  --color-accent-primary-hover: #818CF8;
+  --color-accent-success: #10B981;
+  --color-accent-warning: #F59E0B;
+  --color-accent-error: #EF4444;
+
+  --color-category-web: #3B82F6;
+  --color-category-pwn: #EF4444;
+  --color-category-rev: #8B5CF6;
+  --color-category-crypto: #F59E0B;
+  --color-category-forensic: #10B981;
+  --color-category-misc: #6B7280;
+
+  /* Pretendard Variable은 한글·일본어·중국어를 포함하는 본문 기본 계열이다.
+     웹폰트 로드 실패 시에는 OS CJK 계열을 순서대로 사용한다. */
+  --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+    "Apple SD Gothic Neo", "Noto Sans KR", "Noto Sans JP", "Noto Sans SC", "Segoe UI",
+    "Malgun Gothic", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+/* === 라이트 모드 — @theme 밖에서 오버라이드해야 우선순위 확보 === */
+:root.light {
+  color-scheme: light;
+
+  --color-bg-primary: #F5F7FA;
+  --color-bg-surface: #FFFFFF;
+  --color-bg-elevated: #EDF0F4;
+
+  --color-border: #D1D9E6;
+  --color-border-light: #B8C4D4;
+
+  --color-text-primary: #1A202C;
+  --color-text-secondary: #4A5568;
+  --color-text-muted: #718096;
+
+  --color-accent-primary: #4F46E5;
+  --color-accent-primary-hover: #4338CA;
+  --color-accent-success: #059669;
+  --color-accent-warning: #D97706;
+  --color-accent-error: #DC2626;
+
+  --color-category-web: #2563EB;
+  --color-category-pwn: #DC2626;
+  --color-category-rev: #7C3AED;
+  --color-category-crypto: #D97706;
+  --color-category-forensic: #059669;
+  --color-category-misc: #4B5563;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-bg-primary);
+    color: var(--color-text-primary);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: 0;
+    line-height: 1.6;
+    word-break: keep-all;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* === 라이트 모드 헤더: 다크 배경 유지 (가시성 확보) === */
+:root.light .header-always-dark {
+  --color-bg-primary: #0A0E17;
+  --color-bg-surface: #111827;
+  --color-bg-elevated: #1A2332;
+  --color-border: #1E293B;
+  --color-border-light: #2D3B4E;
+  --color-text-primary: #F1F5F9;
+  --color-text-secondary: #CBD5E1;
+  --color-text-muted: #94A3B8;
+  --color-accent-primary: #818CF8;
+  --color-accent-primary-hover: #A5B4FC;
+}
+:root.light .header-always-dark {
+  background-color: #0A0E17 !important;
+}
+
+/* === 접근성 패널: 라이트 모드일 때 실제 테마 색상 복원 === */
+:root.light .a11y-panel-theme-aware {
+  --color-bg-primary: #F5F7FA;
+  --color-bg-surface: #FFFFFF;
+  --color-bg-elevated: #EDF0F4;
+  --color-border: #D1D9E6;
+  --color-border-light: #B8C4D4;
+  --color-text-primary: #1A202C;
+  --color-text-secondary: #4A5568;
+  --color-text-muted: #718096;
+  --color-accent-primary: #4F46E5;
+  --color-accent-primary-hover: #4338CA;
+}
+
+/* === 색각 모드 필터 === */
+[data-color-vision="protanopia"] { filter: url('#protanopia-filter'); }
+[data-color-vision="deuteranopia"] { filter: url('#deuteranopia-filter'); }
+[data-color-vision="tritanopia"] { filter: url('#tritanopia-filter'); }
+[data-color-vision="high-contrast"] {
+  --color-border: #FFFFFF;
+  --color-text-secondary: #D1D5DB;
+}
+.light[data-color-vision="high-contrast"] {
+  --color-border: #1A202C;
+  --color-text-secondary: #1E293B;
+}
+[data-color-vision="high-contrast"] * {
+  border-color: inherit !important;
+}
+
+/* === 키보드 탐색 강조 === */
+[data-keyboard-nav="true"] *:focus-visible {
+  outline: 3px solid #6366F1;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* === 모션 감소 === */
+[data-reduced-motion="true"] *,
+[data-reduced-motion="true"] *::before,
+[data-reduced-motion="true"] *::after {
+  animation-duration: 0.01ms !important;
+  transition-duration: 0.01ms !important;
+}
+
+/* === 쉬운 읽기 모드 === */
+[data-easy-read="true"] {
+  line-height: 1.8;
+  letter-spacing: 0.03em;
+  word-spacing: 0.1em;
+}
+[data-easy-read="true"] [data-tooltip] {
+  text-decoration: underline dotted;
+  cursor: help;
+}
+
+/* === 기본 포커스 스타일 === */
+:focus-visible {
+  outline: 2px solid #6366F1;
+  outline-offset: 2px;
+}
+
+/* === skip-to-content 링크 === */
+.skip-link {
+  position: absolute;
+  top: -100%;
+  left: 0;
+  z-index: 9999;
+  padding: 0.75rem 1.5rem;
+  background: #6366F1;
+  color: white;
+  font-weight: 600;
+}
+.skip-link:focus {
+  top: 0;
+}
+
+/* === 헤더/모바일 메뉴 애니메이션 === */
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slide-out-right {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scanline {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-slide-out-right {
+  animation: slide-out-right 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out forwards;
+}
+
+
+/* 풋터 그리드 라인 배경 */
+.footer-grid-bg {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--color-border) 30%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-border) 30%, transparent) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* === 로고 그라디언트 === */
+.logo-gradient {
+  background: linear-gradient(135deg, var(--color-text-primary) 0%, var(--color-accent-primary) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* === 카드 글로우 (hover) === */
+.card-glow {
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.card-glow:hover {
+  border-color: var(--color-accent-primary);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--color-accent-primary) 20%, transparent),
+    0 4px 24px color-mix(in srgb, var(--color-accent-primary) 8%, transparent);
+}
+
+/* 카테고리별 글로우 변형 */
+.card-glow-web:hover {
+  border-color: var(--color-category-web);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-web) 10%, transparent);
+}
+.card-glow-pwn:hover {
+  border-color: var(--color-category-pwn);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-pwn) 10%, transparent);
+}
+.card-glow-rev:hover {
+  border-color: var(--color-category-rev);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-rev) 10%, transparent);
+}
+.card-glow-crypto:hover {
+  border-color: var(--color-category-crypto);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-crypto) 10%, transparent);
+}
+.card-glow-forensic:hover {
+  border-color: var(--color-category-forensic);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-forensic) 10%, transparent);
+}
+.card-glow-misc:hover {
+  border-color: var(--color-category-misc);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--color-category-misc) 10%, transparent);
+}
+
+/* === 난이도 배지 색상 (8단계) === */
+.diff-beginner    { color: #10b981; }  /* emerald-500 */
+.diff-easy        { color: #22c55e; }  /* green-500 */
+.diff-medium-low  { color: #84cc16; }  /* lime-500 */
+.diff-medium      { color: #eab308; }  /* yellow-500 */
+.diff-medium-high { color: #f59e0b; }  /* amber-500 */
+.diff-hard        { color: #f97316; }  /* orange-500 */
+.diff-expert      { color: #ef4444; }  /* red-500 */
+.diff-impossible  { color: #a855f7; }  /* purple-500 */
+
+/* === 랭킹 포디움 행 === */
+.rank-gold {
+  background: linear-gradient(90deg, color-mix(in srgb, #FFD700 6%, transparent), transparent);
+}
+.rank-silver {
+  background: linear-gradient(90deg, color-mix(in srgb, #C0C0C0 5%, transparent), transparent);
+}
+.rank-bronze {
+  background: linear-gradient(90deg, color-mix(in srgb, #CD7F32 4%, transparent), transparent);
+}
+
+/* === 검색 입력 래퍼 === */
+.search-input-wrapper {
+  position: relative;
+}
+.search-input-wrapper svg {
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--color-text-muted);
+}
+.search-input-wrapper input {
+  padding-left: 2.5rem;
+}
+
+/* === datetime-local 입력 — 다크/라이트 모드 호환 === */
+.datetime-input {
+  color-scheme: inherit;
+}
+.datetime-input::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.7;
+  padding: 2px;
+}
+.datetime-input::-webkit-calendar-picker-indicator:hover {
+  opacity: 1;
+}
+
+/* === 스켈레톤 개선 — 그라디언트 시머 === */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-surface) 25%,
+    var(--color-bg-elevated) 50%,
+    var(--color-bg-surface) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* === 그라디언트 상단 장식선 === */
+.gradient-top-line {
+  height: 2px;
+  background: linear-gradient(90deg,
+    transparent,
+    var(--color-accent-primary),
+    var(--color-accent-success),
+    var(--color-accent-primary),
+    transparent
+  );
+  opacity: 0.6;
+}
+
+/* === 공용 rich-content / TipTap 표·코드 === */
+.rich-content,
+.ProseMirror {
+  overflow-wrap: anywhere;
+}
+
+.rich-content pre,
+.ProseMirror pre {
+  tab-size: 4;
+  white-space: pre-wrap;
+}
+
+.rich-content table,
+.ProseMirror table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.rich-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.rich-content th,
+.rich-content td,
+.ProseMirror th,
+.ProseMirror td {
+  min-width: 7rem;
+  border: 1px solid var(--color-border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rich-content th,
+.ProseMirror th {
+  background: var(--color-bg-surface);
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+
+.ProseMirror .selectedCell {
+  background: color-mix(in srgb, var(--color-accent-primary) 14%, transparent);
+}

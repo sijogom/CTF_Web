@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "normalize": [
+    {
+      "name": "plain-multiline",
+      "input": "첫 줄\n둘째 줄",
+      "kind": "plain",
+      "expected_html": "<p>첫 줄<br>\n둘째 줄</p>"
+    },
+    {
+      "name": "markdown-strike",
+      "input": "~~취소~~",
+      "kind": "markdown",
+      "expected_html": "<p><s>취소</s></p>"
+    },
+    {
+      "name": "markdown-indented-code",
+      "input": "    first\n    second",
+      "kind": "markdown",
+      "expected_html": "<pre><code>first\nsecond\n</code></pre>"
+    },
+    {
+      "name": "markdown-fenced-code-preserves-inner-space",
+      "input": "```python\n  print(\"x\")  \n```",
+      "kind": "markdown",
+      "expected_html": "<pre><code class=\"language-python\">  print(\"x\")  \n</code></pre>"
+    },
+    {
+      "name": "markdown-fenced-c-plus-plus-language",
+      "input": "```c++\nint main() {}\n```",
+      "kind": "markdown",
+      "expected_html": "<pre><code class=\"language-c++\">int main() {}\n</code></pre>"
+    },
+    {
+      "name": "markdown-fenced-c-sharp-language",
+      "input": "```c#\nclass Program {}\n```",
+      "kind": "markdown",
+      "expected_html": "<pre><code class=\"language-c#\">class Program {}\n</code></pre>"
+    },
+    {
+      "name": "gfm-table-alignment",
+      "input": "| a | b |\n| :--- | ---: |\n| 1 | 2 |",
+      "kind": "markdown",
+      "expected_html": "<table>\n<thead>\n<tr>\n<th align=\"left\">a</th>\n<th align=\"right\">b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td align=\"left\">1</td>\n<td align=\"right\">2</td>\n</tr>\n</tbody>\n</table>"
+    },
+    {
+      "name": "signed-image-and-relative-link",
+      "input": "<p><a href=\"/learn?q=1&amp;next=%2Fctf\">이동</a><img src=\"/lesson-assets/a.png?X-Signature=AbC123&amp;X-Expires=600\" alt=\"도식\"></p>",
+      "kind": "html",
+      "expected_html": "<p><a href=\"/learn?q=1&amp;next=%2Fctf\">이동</a><img src=\"/lesson-assets/a.png?X-Signature=AbC123&amp;X-Expires=600\" alt=\"도식\"></p>"
+    },
+    {
+      "name": "blank-link-rel",
+      "input": "<p><a href=\"https://example.org/x\" target=\"_blank\" rel=\"nofollow\">외부</a></p>",
+      "kind": "html",
+      "expected_html": "<p><a href=\"https://example.org/x\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">외부</a></p>"
+    },
+    {
+      "name": "image-only-content",
+      "input": "<p><img src=\"/lesson-assets/only.png\" alt=\"그림😀\"></p>",
+      "kind": "html",
+      "expected_html": "<p><img src=\"/lesson-assets/only.png\" alt=\"그림😀\"></p>"
+    },
+    {
+      "name": "html5-lossless-tbody-insertion",
+      "input": "<table><tr><td>x</td></tr></table>",
+      "kind": "html",
+      "expected_html": "<table><tbody><tr><td>x</td></tr></tbody></table>"
+    },
+    {
+      "name": "empty-editor-document",
+      "input": "<p><br></p>",
+      "kind": "html",
+      "allow_empty": true,
+      "expected_html": ""
+    }
+  ],
+  "reject": [
+    {"name": "mixed-text-html", "input": "앞 문장 <strong>강조</strong>", "code": "rich_content_review_required"},
+    {"name": "malformed-html", "input": "<p>닫히지 않음", "code": "rich_content_review_required"},
+    {"name": "script-tag", "input": "<script>alert(1)</script>", "code": "rich_content_review_required"},
+    {"name": "event-attribute", "input": "<p onclick=\"alert(1)\">본문</p>", "code": "rich_content_review_required"},
+    {"name": "style-attribute", "input": "<p style=\"color:red\">본문</p>", "code": "rich_content_review_required"},
+    {"name": "javascript-link", "input": "<p><a href=\"javascript:alert(1)\">링크</a></p>", "code": "rich_content_review_required"},
+    {"name": "data-image", "input": "<p><img src=\"data:image/png;base64,AAAA\"></p>", "code": "rich_content_review_required"},
+    {"name": "protocol-relative", "input": "<p><img src=\"//example.org/a.png\"></p>", "code": "rich_content_review_required"},
+    {"name": "backslash-url", "input": "<p><a href=\"\\\\example.org\\x\">링크</a></p>", "code": "rich_content_review_required"},
+    {"name": "invalid-colspan", "input": "<table><tbody><tr><td colspan=\"101\">값</td></tr></tbody></table>", "code": "rich_content_review_required"},
+    {"name": "unsafe-markdown-link", "input": "[링크](javascript:alert(1))", "code": "rich_content_review_required"},
+    {"name": "c-include-is-ambiguous", "input": "#include <stdio.h>", "code": "rich_content_review_required"},
+    {"name": "flag-placeholder-is-ambiguous", "input": "문자열 <FLAG> 예제", "code": "rich_content_review_required"},
+    {"name": "html5-table-foster-parenting", "input": "<table><tbody><tr><td>x</td></tr></tbody><p>outside</p></table>", "code": "rich_content_review_required"},
+    {"name": "html5-block-inside-inline-repair", "input": "<p><strong>one<div>two</div></strong></p>", "code": "rich_content_review_required"}
+  ],
+  "plain_text": [
+    {"input": "<p>a</p><p>b</p>", "expected": "a\nb", "visible_code_points": 2},
+    {"input": "<p>a<br>b</p>", "expected": "a\nb", "visible_code_points": 2},
+    {"input": "<table><tbody><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></tbody></table>", "expected": "a\tb\n1\t2", "visible_code_points": 4},
+    {"input": "<p><img src=\"/x\" alt=\"그림😀\"></p>", "expected": "그림😀", "visible_code_points": 3}
+  ]
+}

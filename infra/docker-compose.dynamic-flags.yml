@@ -1,0 +1,14 @@
+# dynamic_instance 플래그 활성화 전용 오버레이.
+# static/regex 문제는 이 파일을 합치지 않아도 정상 동작하며 flag.txt를 요구하지 않는다.
+# Docker가 없는 경로를 자동 생성하지 않으므로, 관리형 시작 경로가 먼저 1001:1001, 0700
+# 런타임 디렉터리를 확인한 경우에만 이 오버레이를 사용한다.
+
+services:
+  env-orchestrator:
+    volumes:
+      - type: bind
+        source: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        target: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        read_only: false
+        bind:
+          create_host_path: false

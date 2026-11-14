@@ -1,0 +1,16 @@
+auth/me
+admin/users
+admin/settings
+admin/audit
+admin/maintenance
+learn/courses
+learn/progress/me
+learn/recommend
+community/posts
+community/reports
+env/instances
+competitions
+competitions/1/join
+competitions/1/scoreboard
+teams
+reports

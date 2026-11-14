@@ -1,0 +1,156 @@
+# 개발용 — 인프라만 실행 (백엔드 서비스는 uvicorn으로 직접 실행)
+# 사용법: docker compose -p ctf_web -f docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ctf-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ctfplatform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword123}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-auth_dev_pass}
+      LEARN_DB_PASSWORD: ${LEARN_DB_PASSWORD:-learn_dev_pass}
+      COMMUNITY_DB_PASSWORD: ${COMMUNITY_DB_PASSWORD:-community_dev_pass}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ctfplatform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ctf-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-devredis123}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: ctf-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 개발용 메일 서버 (실제 메일 발송 없이 UI에서 확인)
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: ctf-mailpit
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"   # SMTP
+      - "127.0.0.1:8025:8025"   # 메일 확인 웹 UI
+
+  # WSL 개발용 리버스 프록시: HTTP :8080, host network로 WSL 서비스에 접근
+  caddy:
+    container_name: ctf-caddy-dev
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      CADDY_SITE_ADDRESS: ":8080"
+      FRONTEND_HOST: ${FRONTEND_HOST:-localhost}
+      AUTH_HOST: localhost
+      LEARN_HOST: localhost
+      COMMUNITY_HOST: localhost
+      ENV_ORCH_HOST: localhost
+      MINIO_HOST: 127.0.0.1
+      AUTH_PORT: ${AUTH_PORT:-8020}
+      LEARN_PORT: ${LEARN_PORT:-8100}
+      COMMUNITY_PORT: ${COMMUNITY_PORT:-8300}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3100}
+      ENV_ORCH_PORT: ${ENV_ORCH_PORT:-8200}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # 챌린지 환경 오케스트레이터 (Go)
+  # Docker 소켓 마운트로 챌린지 컨테이너 관리
+  # 주의: auth-service(8020), learn-service(8100)에도 의존하지만,
+  # 이들은 WSL에서 별도 프로세스로 실행되므로 Docker depends_on 추가 불가.
+  # 시작 순서는 server.sh가 보장함 (Docker → 백엔드 → 프론트엔드 순서).
+  env-orchestrator:
+    build:
+      context: ../services/env-orchestrator
+    container_name: ctf-env-orchestrator
+    restart: unless-stopped
+    network_mode: host
+    # Learn이 발급한 MinIO presigned URL의 호스트명을 유지한다. host 모드에서는
+    # Compose service DNS를 사용할 수 없으므로 loopback publish로 해석한다.
+    extra_hosts:
+      - "minio=127.0.0.1"
+    environment:
+      # host-network 개발 경로도 Caddy만 Env API 공개 진입점으로 둔다.
+      LISTEN_ADDR: 127.0.0.1:8200
+      REDIS_URL: redis://:${REDIS_PASSWORD:-devredis123}@127.0.0.1:6379/2
+      LEARN_SERVICE_URL: http://127.0.0.1:${LEARN_PORT:-8100}
+      AUTH_SERVICE_URL: http://127.0.0.1:${AUTH_PORT:-8020}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY 필수}
+      CHALLENGE_NETWORK: ctf-challenges
+      BASE_PATH: /ctf
+      # dynamic_instance 플래그 파일은 Docker daemon이 접근 가능한 호스트 경로에 둔다.
+      DYNAMIC_FLAG_RUNTIME_DIR: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+      CONTAINER_TTL_MINUTES: 30
+      CONTAINER_MAX_PER_USER: 2
+      CONTAINER_MAX_GLOBAL: ${CONTAINER_MAX_GLOBAL:-50}
+      CONTAINER_READINESS_TIMEOUT_SECONDS: ${CONTAINER_READINESS_TIMEOUT_SECONDS:-45}
+      CHALLENGE_PORT_MIN: 10000
+      CHALLENGE_PORT_MAX: 60000
+      FRONTEND_PORT: ${FRONTEND_PORT:-3100}
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+    group_add:
+      - "${DOCKER_GID:-999}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # host-network 개발 경로도 Docker 데몬이 읽을 수 있는 동일한 runtime
+      # 디렉터리를 사용한다. 경로가 없으면 Compose 단계에서 fail-closed 한다.
+      - type: bind
+        source: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        target: ${DYNAMIC_FLAG_RUNTIME_DIR:-/var/lib/ctf-web/dynamic-flags}
+        read_only: false
+        bind:
+          create_host_path: false
+    depends_on:
+      redis:
+        condition: service_healthy
+
+networks:
+  ctf-challenges:
+    name: ctf-challenges
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  caddy_data:
+  caddy_config:
